@@ -1,7 +1,7 @@
 // pc_logger.c — experiment-oriented CAN logger/controller for SFBO/PBO tests
 //
 // Build: gcc -O2 -Wall -Wextra -pthread -o pc_logger pc_logger.c
-// Usage: sudo ./pc_logger <iface> [wait_sec=3] [load_interval_us=200] [--trace]
+// Usage: ./pc_logger <iface> [wait_sec=3] [load_interval_us=200] [--trace]
 //
 // Roles (it orchestrates and observes; it does NOT run the attack — SocketCAN cannot do
 // the bit-level collision timing SFBO needs, so the attack runs on the ESP32):
