@@ -251,5 +251,23 @@ behaviour. See the report for full discussion.
 
 ## Reference
 
-S. Serag et al., *Exposing New Vulnerabilities of Error Handling Mechanism in CAN*,
-30th USENIX Security Symposium, 2021.
+## References
+
+[1] S. Serag, M. M. Nasralla, K. M. F. Elsayed, M. M. E. A. Mahmoud, and M. Abdallah,
+*Exposing New Vulnerabilities of Error Handling Mechanism in CAN*,
+30th USENIX Security Symposium (USENIX Security 21), 2021.
+
+[2] Espressif Systems,
+*Two-Wire Automotive Interface (TWAI) — ESP-IDF Programming Guide*,
+2024. Available: https://docs.espressif.com/projects/esp-idf/en/latest/esp32c3/api-reference/peripherals/twai.html
+(Accessed: 2026-06-09).
+
+[3] FreeRTOS,
+*Task Management — FreeRTOS Kernel*,
+Amazon Web Services, 2024. Available: https://www.freertos.org/taskandcr.html
+(Accessed: 2026-06-09).
+
+[4] The Linux Kernel,
+*SocketCAN — Controller Area Network*,
+The Linux Kernel Documentation, 2024. Available: https://www.kernel.org/doc/html/latest/networking/can.html
+(Accessed: 2026-06-09).
