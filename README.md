@@ -249,7 +249,7 @@ behaviour. See the report for full discussion.
 - The report layout in the `0x601` frame must match between `attacker.ino` (`sendReport`)
   and `pc_logger.c` (`handle_report`); if you change one, change both.
 
-## Reference
+---
 
 ## References
 
